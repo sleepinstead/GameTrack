@@ -1,0 +1,1976 @@
+import React, { useState, useEffect, useRef } from "react";
+import { useGameTrackStore } from "../store";
+import { useShallow } from "zustand/react/shallow";
+import {
+  X, Trash2, Edit2, Trophy, EyeOff, ImageUp, RotateCcw, Link2, Loader2, ChevronDown, Check, Plus
+} from "lucide-react";
+import { formatPlaytimePrecise, formatDateShort } from "../utils/time";
+import { motion, AnimatePresence } from "motion/react";
+import { uploadPoster } from "../utils/image";
+import { useModalA11y } from "../hooks/useModalA11y";
+import { STATUSES, getStatusBadgeColor, getStatusLabel, platformIdMatches, mergeCustomPlatforms, OWNERSHIP_STATUSES, getOwnershipLabel, platformsSelectable, PLATFORMS_LOCKED_REASON, isOwned, isReplayed, timesPlayed, totalPlaytime, replayAllowed, type OwnershipStatus } from "../constants";
+import { PosterImage } from "./PosterImage";
+import { ReplayHistory } from "./ReplayHistory";
+import {
+  RunFormDialog, type RunDialogMode, type Draft,
+  emptyDraft, draftFrom, payloadFrom,
+} from "./RunFormDialog";
+import type { Game, Playthrough } from "../types";
+import { lockBodyScroll } from "../utils/scrollLock";
+
+/**
+ * The status radio group's two states, keyed by status.
+ *
+ * The palette is the app's shared one — zinc / blue / emerald / fuchsia, the
+ * same four `getStatusBadgeColor` and `getStatusTextColor` use — rather than a
+ * local copy. The previous local map had drifted: it gave `playing` emerald and
+ * `completed` the brand accent, which is precisely what `constants.ts` warns
+ * against. Yellow there reads as "this is the button you have selected", not
+ * "you finished this game", and the two collided inside one four-button row.
+ *
+ * Every option carries its own colour in both states, dimmed when unselected.
+ * Only the selected one was tinted before, so the other three were identical
+ * grey boxes and the row said nothing about what those statuses look like
+ * everywhere else in the app.
+ */
+/**
+ * `YYYY-MM-DD` for a `<input type="date">`, in LOCAL time.
+ *
+ * `toISOString()` is the obvious one-liner and it is wrong here: it renders the
+ * UTC date, so in any timezone behind UTC an evening completion came back as
+ * the previous day. The save path already parses the field as local midnight
+ * (`new Date(value + "T00:00:00")`), so reading it in local time too makes
+ * load and save the same instant and the round-trip stops drifting.
+ */
+/**
+ * The playtime cell's accessible name and tooltip.
+ *
+ * Stating the split here is what lets the cell itself show only the all-runs
+ * total under the plain word "Playtime". For a game with one run this is just the
+ * hours; for a replayed one it says how much of the total came from the first
+ * playthrough, which is otherwise the only figure this cell used to display.
+ */
+const playtimeTitle = (game: Game): string => {
+  const total = formatPlaytimePrecise(totalPlaytime(game));
+  if (!isReplayed(game)) return total;
+  return `${total} across ${timesPlayed(game)} playthroughs — ${formatPlaytimePrecise(game.playtime)} on the first`;
+};
+
+/**
+ * Shared chrome for the three read-mode metric cells.
+ *
+ * These three sit in a row and read as one group, so they have to stay identical
+ * in everything except their label and value — which is exactly what breaks when
+ * each cell is written inline. The Playtime cell is a button that opens a dialog;
+ * Your Rating and Completed open the edit form on the matching field; and until
+ * the game is Completed the Playtime cell drops back to a plain box. Written three times,
+ * those variants drift — the affordance ends up on two cells and not the third,
+ * or survives on one after the action behind it was removed.
+ */
+const METRIC_CELL_BASE =
+  "bg-zinc-900/60 border p-3.5 flex flex-col justify-between h-[76px]";
+const METRIC_LABEL =
+  "text-[8px] sm:text-[11px] text-brand-muted uppercase font-bold tracking-widest leading-none";
+
+/**
+ * The dashed rule under a metric's value is the click affordance, and it is
+ * visible AT REST, not just on hover. It cannot be hover-only: a keyboard user
+ * tabbing to the cell never generates a hover state, and a touch user never does
+ * either — so a hover-only affordance is invisible to exactly the people who most
+ * need to be told the thing is interactive.
+ *
+ * `zinc-500`, not `brand-border`. The structural border token is #27272A on a
+ * #18181B cell — measured at 1.3:1 against the painted background, which reads as
+ * a faint smudge rather than a rule. Right for a frame, wrong for a signal.
+ * Zinc-600 only reached 2.51:1; zinc-500 clears the 3:1 that WCAG asks of a
+ * meaningful UI boundary, while still sitting below the value so it never competes
+ * with the number. It goes accent on hover/focus, so the interaction reads as
+ * escalation rather than as a change of object.
+ *
+ * `w-fit` so the rule hugs the text; stretched to the cell's full width it would
+ * read as a divider between the three metrics, which is the opposite message.
+ */
+const METRIC_VALUE_RULE =
+  "mt-2 leading-none uppercase w-fit border-b-2 border-dashed border-zinc-500 group-hover:border-brand-accent group-focus-visible:border-brand-accent transition-colors pb-1";
+
+/**
+ * One metric cell. Renders as a button when there is something to open and as a
+ * plain box when there is not, so "looks interactive" and "is interactive" cannot
+ * come apart.
+ *
+ * `cornerAction` is rendered as a SIBLING of the cell, not a child. The cell is
+ * itself a <button>, and a <button> may not contain another <button>: the parser
+ * closes the outer one at the inner one's open tag, which throws the cell's own
+ * label, value and click handler out of the DOM and leaves a control with no
+ * accessible name. The wrapper is only added when there is something to put in
+ * it, so the read-only and single-action cells keep their original markup.
+ */
+const MetricCell: React.FC<{
+  label: string;
+  /** Omitted for a read-only cell — which then gets no cursor, hover or rule. */
+  onOpen?: () => void;
+  ariaLabel?: string;
+  /** Playtime's own cell turns dashed/red while the hours are hidden. */
+  hiddenBorder?: boolean;
+  valueClassName?: string;
+  /** An extra control pinned to the cell's top-right, for an action that is not
+   *  "open this cell" — log a replay, as distinct from opening the history. */
+  cornerAction?: React.ReactNode;
+  value: React.ReactNode;
+}> = ({ label, onOpen, ariaLabel, hiddenBorder = false, valueClassName = "text-white", cornerAction, value }) => {
+  const frame = hiddenBorder
+    ? "border-dashed border-red-500/25"
+    : "border-brand-border/50";
+  const cell = onOpen ? (
+    <button
+      type="button"
+      onClick={onOpen}
+      aria-label={ariaLabel}
+      className={`group text-left w-full cursor-pointer transition-colors hover:bg-zinc-900 focus:outline-none focus-visible:border-brand-accent ${METRIC_CELL_BASE} ${frame} hover:border-brand-accent/50`}
+    >
+      <p className={METRIC_LABEL}>{label}</p>
+      <h5 className={`text-sm sm:text-lg font-black ${METRIC_VALUE_RULE} ${valueClassName}`}>
+        {value}
+      </h5>
+    </button>
+  ) : (
+    <div className={`${METRIC_CELL_BASE} ${frame}`}>
+      <p className={METRIC_LABEL}>{label}</p>
+      <h5 className={`text-sm sm:text-lg font-black mt-2 leading-none uppercase ${valueClassName}`}>
+        {value}
+      </h5>
+    </div>
+  );
+  return cornerAction ? <div className="relative">{cell}{cornerAction}</div> : cell;
+};
+
+const formatDateInputValue = (d: Date): string => {
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+};
+
+/* Status selector tones — resting state is uncoloured (transparent bg,
+   brand-border, brand-muted text) so the row reads as a single
+   decision surface. Colour appears only on the selected item (full
+   semantic bg/border/text) and on hover (semantic tint + text). */
+const NEUTRAL_STATUS_TONE = {
+  on: "bg-zinc-500/25 border-zinc-400 text-zinc-100",
+  off: "border-brand-border text-brand-muted hover:bg-zinc-500/15 hover:text-zinc-300",
+};
+
+const STATUS_SELECTOR_TONES: Record<string, { on: string; off: string }> = {
+  backlog: NEUTRAL_STATUS_TONE,
+  playing: {
+    on: "bg-blue-500/20 border-blue-500/50 text-blue-400",
+    off: "border-brand-border text-brand-muted hover:bg-blue-500/15 hover:text-blue-400",
+  },
+  completed: {
+    on: "bg-emerald-500/20 border-emerald-500/50 text-emerald-400",
+    off: "border-brand-border text-brand-muted hover:bg-emerald-500/15 hover:text-emerald-400",
+  },
+  endless: {
+    on: "bg-fuchsia-500/20 border-fuchsia-500/50 text-fuchsia-400",
+    off: "border-brand-border text-brand-muted hover:bg-fuchsia-500/15 hover:text-fuchsia-400",
+  },
+};
+
+export const GameDetailsModal: React.FC = React.memo(() => {
+  const {
+    selectedGame, setSelectedGame, updateGame, deleteGame,
+    syncGameSynopsis, resetGamePoster, resetGameMetadata,
+    showToast, customPlatforms, customizations,
+    games, openPlayingConflict, playingConflict,
+    addPlaythrough, updatePlaythrough,
+  } = useGameTrackStore(useShallow((s) => ({
+    selectedGame: s.selectedGame, setSelectedGame: s.setSelectedGame,
+    updateGame: s.updateGame, deleteGame: s.deleteGame,
+    syncGameSynopsis: s.syncGameSynopsis, resetGamePoster: s.resetGamePoster,
+    resetGameMetadata: s.resetGameMetadata, showToast: s.showToast,
+    customPlatforms: s.customPlatforms, customizations: s.customizations,
+    games: s.games, openPlayingConflict: s.openPlayingConflict,
+    playingConflict: s.playingConflict,
+    addPlaythrough: s.addPlaythrough, updatePlaythrough: s.updatePlaythrough,
+  })));
+
+  const availablePlatforms = React.useMemo(() => mergeCustomPlatforms(customPlatforms), [customPlatforms]);
+
+  const [isEditing, setIsEditing] = useState(false);
+  const [editStatus, setEditStatus] = useState<"backlog" | "playing" | "completed" | "endless">("backlog");
+  const [editOwnership, setEditOwnership] = useState<OwnershipStatus>("owned");
+  const [title, setTitle] = useState("");
+  const [year, setYear] = useState("");
+  const [dateCompleted, setDateCompleted] = useState("");
+  const [genres, setGenres] = useState("");
+  const [synopsis, setSynopsis] = useState("");
+  const [posterUrl, setPosterUrl] = useState("");
+  const [criticScore, setCriticScore] = useState("");
+  const [personalRating, setPersonalRating] = useState("");
+  const [selectedPlatforms, setSelectedPlatforms] = useState<string[]>([]);
+  const [hidePlaytime, setHidePlaytime] = useState(false);
+  const [deleteConfirm, setDeleteConfirm] = useState(false);
+  // Delete is the one irreversible action in the modal, so the dialog stays open
+  // showing "Deleting…" while the request is in flight rather than closing and
+  // letting the button be pressed twice.
+  const [deleting, setDeleting] = useState(false);
+  const [saving, setSaving] = useState(false);
+  // Quick status picker — the full-width status button in the sidebar opens
+  // this instead of forcing the user through the whole edit form.
+  const [statusPickerOpen, setStatusPickerOpen] = useState(false);
+  const [statusBusy, setStatusBusy] = useState(false);
+
+  // Change Poster modal — URL entry or device upload.
+  const [posterModalOpen, setPosterModalOpen] = useState(false);
+  // Replay history modal. Opens from the hours metric, so the read view's
+  // per-run list stays out of the scroll area until it is asked for.
+  const [replayModalOpen, setReplayModalOpen] = useState(false);
+  /* The add/edit run dialog, a THIRD layer above the details modal and the replay
+     history. It lives here rather than inside ReplayHistory because of the trap
+     and Escape notes further down: two dialogs registering window-level Tab
+     handlers is exactly what this file already got wrong once, and the fix is for
+     one component to own every layer so it can stand the parent traps down in the
+     right order. `null` is closed; the kind distinguishes add from edit, and the
+     edit branch carries the run being changed. */
+  const [runDialog, setRunDialog] = useState<RunDialogMode | null>(null);
+  const [runDraft, setRunDraft] = useState<Draft>(emptyDraft);
+  const [runBusy, setRunBusy] = useState(false);
+  /**
+   * Which edit-form field the "Your Rating" and "Completed" metric cells should
+   * land on. Set by `openEditAt` and cleared by the effect below once it has
+   * fired, so it is a one-shot instruction rather than state the UI renders from.
+   */
+  const [editFocusTarget, setEditFocusTarget] = useState<"rating" | "completed" | null>(null);
+  const [posterUrlInput, setPosterUrlInput] = useState("");
+  const [posterSaving, setPosterSaving] = useState(false);
+  const [resettingMetadata, setResettingMetadata] = useState(false);
+
+  // Hours played (edit form)
+  const [hoursPlayed, setHoursPlayed] = useState("");
+  const [minutesPlayed, setMinutesPlayed] = useState("");
+  const ratingValue = personalRating === "" ? 0 : parseInt(personalRating, 10) || 0;
+
+  // True once the user types in the synopsis textarea; while set, background
+  // synopsis refreshes (IGDB auto-sync) must not clobber their in-progress edit.
+  const synopsisDirtyRef = useRef(false);
+  // Same guard for the poster mirror below: don't overwrite what the user picked.
+  const posterDirtyRef = useRef(false);
+
+  // Only re-initialize the form when the *selected game changes* (new id), or
+  // when edit mode is entered. Not when the same game's data is refreshed in the
+  // store (poster upload, IGDB sync, Steam sync) — a refresh replaces the row
+  // with a new object of the same id, and re-initialising on that would discard
+  // the user's in-progress edits and kick them out of edit mode.
+  const lastGameIdRef = useRef<number | null>(null);
+  // Whether the previous render was already in edit mode, so the effect can tell
+  // "edit mode just opened" from "edit mode is still open".
+  const wasEditingRef = useRef(false);
+  useEffect(() => {
+    if (!selectedGame) {
+      lastGameIdRef.current = null;
+      wasEditingRef.current = false;
+      return;
+    }
+    // Two triggers, and only two. The second one is not cosmetic: ownership
+    // doubles as the gate on the platform controls, so a form left showing an
+    // abandoned edit would offer a platform picker against a row that cannot
+    // store one — while the read view beside it says the opposite. Leaving edit
+    // mode is "cancel", and the next entry must show what is stored.
+    const enteringEdit = isEditing && !wasEditingRef.current;
+    wasEditingRef.current = isEditing;
+    const newGame = selectedGame.id !== lastGameIdRef.current;
+    if (!newGame && !enteringEdit) return;
+    lastGameIdRef.current = selectedGame.id;
+
+    setTitle(selectedGame.title);
+    setYear(selectedGame.year?.toString() || "");
+    // Formatted in LOCAL time, not `toISOString()`. The save below writes
+    // `new Date(value + "T00:00:00")`, which is local midnight, so the value
+    // read back has to be the local date too. Reading it as UTC and writing it
+    // back as local slid every completion one day earlier on each save: a title
+    // stored at 2026-09-16T18:30Z showed 2026-09-16 in the field and re-saved
+    // as 2026-09-15T18:30Z.
+    setDateCompleted(
+      selectedGame.date_completed ? formatDateInputValue(new Date(selectedGame.date_completed)) : ""
+    );
+    setGenres(selectedGame.genres?.join(", ") || "");
+    setSynopsis(selectedGame.synopsis);
+    synopsisDirtyRef.current = false;
+    setPosterUrl(selectedGame.poster_url);
+    setCriticScore(selectedGame.critic_score?.toString() || "");
+    setHidePlaytime(selectedGame.hide_playtime === 1);
+    setEditStatus(
+      (["backlog", "playing", "completed", "endless"] as const).includes(
+        selectedGame.status as "backlog" | "playing" | "completed" | "endless"
+      )
+        ? (selectedGame.status as "backlog" | "playing" | "completed" | "endless")
+        : "backlog"
+    );
+    setPersonalRating(selectedGame.personal_rating?.toString() || "");
+    // `isOwned` rather than a raw read: a row loaded from a pre-migration
+    // payload has no flag, and defaulting that to the form's initial state
+    // would silently show the wrong ownership for it.
+    setEditOwnership(isOwned(selectedGame) ? "owned" : "not_owned");
+    // Stored platform values may be aliases ("ps5", "PlayStation 5"...) —
+    // canonicalize them to the checkbox ids so toggles match and saving
+    // doesn't strip platforms.
+    setSelectedPlatforms(
+      availablePlatforms
+        .map((p) => p.id)
+        .filter((pid) => (selectedGame.owned_platforms || []).some((p) => platformIdMatches(pid, p)))
+    );
+    // Only a *different* game resets edit mode. Entering edit mode is the whole
+    // reason this pass ran, so clearing the flag here would immediately undo the
+    // click that caused it — the button would never appear to do anything.
+    if (newGame) setIsEditing(false);
+    setDeleteConfirm(false);
+    closePosterModal();
+
+    // Initialize hours + minutes to represent the current playtime
+    const totalPlaytime = selectedGame.playtime || 0;
+    const hoursFloor = Math.floor(totalPlaytime);
+    const minutesRounding = Math.round((totalPlaytime - hoursFloor) * 60);
+    setHoursPlayed((hoursFloor + Math.floor(minutesRounding / 60)).toString());
+    setMinutesPlayed((minutesRounding % 60).toString());
+  }, [selectedGame, isEditing]);
+
+  // Automatically sync from IGDB if description is missing.
+  //
+  // Separate from the form initialisation above, and keyed on the same things
+  // that decide whether the text is actually missing. Folding this into the
+  // init effect would re-arm it every time edit mode is opened, turning a single
+  // fetch per game into a request per modal visit whenever the first one failed
+  // to find a synopsis — the app would retry forever on a game that has none.
+  useEffect(() => {
+    if (!selectedGame?.igdb_id) return;
+    if (selectedGame.synopsis && selectedGame.synopsis !== "No synopsis available." && selectedGame.synopsis !== "No details provided." && selectedGame.synopsis.trim() !== "") return;
+    syncGameSynopsis(selectedGame.id, selectedGame.igdb_id);
+  }, [selectedGame?.id, selectedGame?.igdb_id, selectedGame?.synopsis, syncGameSynopsis]);
+
+  // Mirror background synopsis refreshes (auto IGDB sync, poster uploads) into
+  // the local form state so entering edit mode later shows the fresh text —
+  // unless the user is mid-edit on the synopsis field.
+  useEffect(() => {
+    if (synopsisDirtyRef.current) return;
+    if (!selectedGame || selectedGame.id !== lastGameIdRef.current) return;
+    setSynopsis(selectedGame.synopsis);
+  }, [selectedGame?.synopsis, selectedGame?.id]);
+
+  /* Same mirroring for the poster, which the synopsis block above covers but the
+     poster did not. `posterUrl` is form state seeded once by the init effect, so
+     any later refresh of the row's artwork — Settings → Sync Steam, an IGDB
+     poster sync, another tab — left the modal rendering the old image while every
+     neighbouring field (status, critic score, platforms, times played) updated
+     live from the store. Worse, pressing Save then wrote that stale URL back,
+     quietly undoing the refresh. */
+  useEffect(() => {
+    if (posterDirtyRef.current) return;
+    if (!selectedGame || selectedGame.id !== lastGameIdRef.current) return;
+    setPosterUrl(selectedGame.poster_url || "");
+  }, [selectedGame?.poster_url, selectedGame?.id]);
+  const handlePlatformToggle = (platformId: string) => {
+    setSelectedPlatforms((prev) =>
+      prev.includes(platformId)
+        ? prev.filter((id) => id !== platformId)
+        : [...prev, platformId]
+    );
+  };
+
+  // Platforms describe copies in the collection, so they are unavailable while
+  // the title is marked Not Owned. The same rule drives the disabled state of the
+  // controls, the selection being dropped on transition, and the payload — one
+  // predicate, so the three cannot disagree.
+  const platformsLocked = !platformsSelectable(editOwnership);
+  const changeOwnership = (next: OwnershipStatus) => {
+    setEditOwnership(next);
+    if (!platformsSelectable(next)) setSelectedPlatforms([]);
+  };
+
+  const handleSaveChanges = async () => {
+    if (!selectedGame) return;
+    if (!title.trim()) {
+      showToast("Game title is required", "error");
+      return;
+    }
+
+    if (year) {
+      const yearNum = parseInt(year, 10);
+      if (isNaN(yearNum) || yearNum < 1950 || yearNum > 2100) {
+        showToast("Release Year must be between 1950 and 2100", "error");
+        return;
+      }
+    }
+
+    if (criticScore) {
+      const scoreNum = parseInt(criticScore, 10);
+      if (isNaN(scoreNum) || scoreNum < 0 || scoreNum > 100) {
+        showToast("Critic Score must be between 0 and 100", "error");
+        return;
+      }
+    }
+
+    if (personalRating) {
+      const ratingNum = parseInt(personalRating, 10);
+      if (isNaN(ratingNum) || ratingNum < 0 || ratingNum > 10) {
+        showToast("Personal Rating must be between 0 and 10", "error");
+        return;
+      }
+    }
+
+    const hoursNum = parseFloat(hoursPlayed || "0");
+    const minutesNum = parseFloat(minutesPlayed || "0");
+    if (
+      isNaN(hoursNum) || !Number.isFinite(hoursNum) || hoursNum < 0 ||
+      isNaN(minutesNum) || !Number.isFinite(minutesNum) || minutesNum < 0
+    ) {
+      showToast("Playtime must be a positive number", "error");
+      return;
+    }
+
+    const calculatedPlaytime = parseFloat((hoursNum + minutesNum / 60).toFixed(2));
+    const genresArray = genres
+      .split(",")
+      .map((g) => g.trim())
+      .filter((g) => g.length > 0);
+
+    setSaving(true);
+    try {
+      const targetStatus = editStatus as "backlog" | "playing" | "completed" | "endless";
+      const basePayload = {
+        title: title.trim(),
+        year: year ? parseInt(year, 10) : null,
+        genres: genresArray,
+        synopsis: synopsis.trim(),
+        critic_score: criticScore ? parseInt(criticScore, 10) : null,
+        playtime: calculatedPlaytime,
+        personal_rating: personalRating ? parseInt(personalRating, 10) : null,
+        owned_platforms: platformsSelectable(editOwnership) ? selectedPlatforms : [],
+        ownership_status: editOwnership,
+        hide_playtime: hidePlaytime ? 1 : 0,
+        status: targetStatus,
+        /* Endless wins outright, including over a date already on the row. The
+           old fallback preserved `selectedGame.date_completed` for any status
+           that was not "completed", so finishing a game and then moving it to
+           Endless left the old date behind — invisible in the analytics totals
+           but still in the API and still on screen. */
+        date_completed: targetStatus === "endless"
+          ? null
+          : dateCompleted
+            ? new Date(dateCompleted + "T00:00:00").getTime()
+            : (targetStatus === "completed" && !selectedGame.date_completed ? Date.now() : selectedGame.date_completed ?? null),
+      };
+
+      // "Playing" is exclusive: if another game is playing, offer to park it.
+      if (targetStatus === "playing" && selectedGame.status !== "playing") {
+        const currentlyPlaying = games.find((g) => g.status === "playing" && g.id !== selectedGame.id);
+        if (currentlyPlaying) {
+          openPlayingConflict({
+            currentGame: currentlyPlaying,
+            pendingTitle: basePayload.title,
+            onConfirmSwitch: async (action) => {
+              await updateGame(currentlyPlaying.id, {
+                status: action === "completed" ? "completed" : "backlog",
+                ...(action === "completed" ? { date_completed: Date.now() } : {}),
+              });
+              const success = await updateGame(selectedGame.id, basePayload);
+              if (success) {
+                setIsEditing(false);
+                synopsisDirtyRef.current = false;
+                showToast("Game updated", "success", "All changes saved");
+              }
+            },
+          });
+          setSaving(false);
+          return;
+        }
+      }
+
+      const success = await updateGame(selectedGame.id, basePayload);
+
+      if (success) {
+        setIsEditing(false);
+        synopsisDirtyRef.current = false;
+        showToast("Game updated", "success", "All changes saved");
+      } else {
+        showToast("Failed to save updates", "error");
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : "An unexpected error occurred";
+      showToast(msg, "error");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+
+  /**
+   * Change status without entering the edit form. Mirrors the two rules the
+   * full save path enforces: "playing" is exclusive (another playing title gets
+   * parked, via the existing conflict dialog), and moving to "completed"
+   * stamps date_completed if it was never set.
+   */
+  const handleQuickStatus = async (next: "backlog" | "playing" | "completed" | "endless") => {
+    if (!selectedGame || next === selectedGame.status) {
+      setStatusPickerOpen(false);
+      return;
+    }
+    setStatusBusy(true);
+    try {
+      const stamp = next === "completed" && !selectedGame.date_completed
+        ? { date_completed: Date.now() }
+        : {};
+
+      if (next === "playing") {
+        const currentlyPlaying = games.find((g) => g.status === "playing" && g.id !== selectedGame.id);
+        if (currentlyPlaying) {
+          openPlayingConflict({
+            currentGame: currentlyPlaying,
+            pendingTitle: selectedGame.title,
+            onConfirmSwitch: async (action) => {
+              await updateGame(currentlyPlaying.id, {
+                status: action === "completed" ? "completed" : "backlog",
+                ...(action === "completed" ? { date_completed: Date.now() } : {}),
+              });
+              await updateGame(selectedGame.id, { status: next, ...stamp });
+              showToast("Status updated", "success", `${selectedGame.title} is now ${getStatusLabel(next).toLowerCase()}`);
+            },
+          });
+          setStatusPickerOpen(false);
+          return;
+        }
+      }
+
+      const success = await updateGame(selectedGame.id, { status: next, ...stamp });
+      if (success) {
+        setStatusPickerOpen(false);
+        showToast("Status updated", "success", `${selectedGame.title} is now ${getStatusLabel(next).toLowerCase()}`);
+      } else {
+        showToast("Failed to update status", "error");
+      }
+    } catch (err: unknown) {
+      showToast(err instanceof Error ? err.message : "An unexpected error occurred", "error");
+    } finally {
+      setStatusBusy(false);
+    }
+  };
+
+  const handleDelete = async () => {
+    if (!selectedGame || deleting) return;
+    setDeleting(true);
+    const success = await deleteGame(selectedGame.id);
+    setDeleting(false);
+    // Closed either way: on success the whole modal is gone, and on failure the
+    // dialog has served its purpose and the toast has said what went wrong.
+    setDeleteConfirm(false);
+    if (success) setSelectedGame(null);
+  };
+
+  // Poster actions — save immediately, independent of edit mode.
+  const closePosterModal = () => {
+    setPosterModalOpen(false);
+    setPosterUrlInput("");
+    setPosterSaving(false);
+  };
+
+  // Both replay-dialog exits — the backdrop and the X — go through here so the
+  // run dialog cannot survive a dismissal of the layer beneath it.
+  const closeReplayHistory = () => {
+    setReplayModalOpen(false);
+    closeRunDialog();
+  };
+
+  /* ── Add / edit run dialog ──────────────────────────────────────────────
+     Both entry points open the history first if it is not already up, because
+     the dialog is meaningless without the ledger it belongs to and the run
+     number it quotes comes from that game's play count. */
+  const openLogReplay = () => {
+    if (!selectedGame) return;
+    setReplayModalOpen(true);
+    setRunDraft(emptyDraft());
+    setRunDialog({ kind: "add", sequence: timesPlayed(selectedGame) + 1 });
+  };
+
+  const openEditRun = (run: Playthrough) => {
+    setReplayModalOpen(true);
+    setRunDraft(draftFrom(run));
+    setRunDialog({ kind: "edit", run });
+  };
+
+  /* Closing discards the draft. The user may have half-typed a run and changed
+     their mind, and reopening "Log Replay" should offer a blank form rather than
+     the last abandoned attempt — the same reasoning the panel's own game-switch
+     reset used. */
+  const closeRunDialog = () => {
+    setRunDialog(null);
+    setRunDraft(emptyDraft());
+    setRunBusy(false);
+  };
+
+  const submitRun = async () => {
+    if (!runDialog || !selectedGame) return;
+    setRunBusy(true);
+    const payload = payloadFrom(runDraft);
+    const ok = runDialog.kind === "edit"
+      ? await updatePlaythrough(runDialog.run.id, selectedGame.id, payload)
+      : await addPlaythrough(selectedGame.id, payload);
+    setRunBusy(false);
+    /* Left open on failure so the typed values survive and the user can fix the
+       one field that caused it, rather than retyping the run. */
+    if (ok) closeRunDialog();
+  };
+
+  const handleUploadPoster = async (file: File) => {
+    if (!selectedGame) return;
+    setPosterSaving(true);
+    try {
+      const url = await uploadPoster(file);
+      const ok = await updateGame(selectedGame.id, { poster_url: url });
+      if (ok) {
+        posterDirtyRef.current = true;
+      setPosterUrl(url);
+        showToast("Poster updated", "success", selectedGame.title);
+        closePosterModal();
+      }
+    } catch (err: unknown) {
+      showToast(err instanceof Error ? err.message : "Failed to upload poster", "error");
+    } finally {
+      setPosterSaving(false);
+    }
+  };
+
+  const handleApplyPosterUrl = async () => {
+    if (!selectedGame) return;
+    const url = posterUrlInput.trim();
+    if (!/^https?:\/\//i.test(url)) {
+      showToast("Enter a valid image URL (https://…)", "error");
+      return;
+    }
+    setPosterSaving(true);
+    try {
+      const ok = await updateGame(selectedGame.id, { poster_url: url });
+      if (ok) {
+        posterDirtyRef.current = true;
+      setPosterUrl(url);
+        showToast("Poster updated", "success", selectedGame.title);
+        closePosterModal();
+      }
+    } finally {
+      setPosterSaving(false);
+    }
+  };
+
+  // Reset restores the default poster: the Steam artwork for Steam-owned
+  // games, the IGDB cover for everything else linked to IGDB.
+  const handleResetPoster = async () => {
+    if (!selectedGame) return;
+    const restored = await resetGamePoster(selectedGame.id);
+    if (restored !== null) {
+      posterDirtyRef.current = true;
+      setPosterUrl(restored);
+      showToast(
+        "Poster reset",
+        "success",
+        selectedGame.steam_appid != null ? "Restored the Steam artwork" : "Restored the IGDB cover"
+      );
+    }
+  };
+
+  // Edit Metadata → Reset: pull every metadata field back to the IGDB
+  // defaults and refill the form. User data (status, playtime, rating,
+  // platforms) is untouched server-side.
+  const handleResetMetadata = async () => {
+    if (!selectedGame) return;
+    setResettingMetadata(true);
+    try {
+      const data = await resetGameMetadata(selectedGame.id);
+      if (!data) return;
+      setTitle(data.title);
+      setYear(data.year?.toString() || "");
+      setGenres(data.genres?.join(", ") || "");
+      setSynopsis(data.synopsis);
+      synopsisDirtyRef.current = false;
+      posterDirtyRef.current = true;
+      setPosterUrl(data.poster_url);
+      setCriticScore(data.critic_score?.toString() || "");
+    } finally {
+      setResettingMetadata(false);
+    }
+  };
+
+  // Using imported getStatusBadgeColor from constants
+
+  // Outer trap pauses while a nested dialog is open, which gets its own trap —
+  // Tab then cycles the inner dialog instead of the background form. The
+  // status picker is nested the same way the poster dialog is.
+  // The parent dialog releases its focus trap while any child dialog is up, or
+  // two traps would fight over Tab — the parent's would pull focus back out of
+  // the confirmation on the very first Tab press.
+  /* The playing-conflict dialog is excluded for the same reason as the others:
+     it is raised from *inside* this modal, and both register a window-level Tab
+     handler. Left armed, this trap evaluated "is focus inside my panel?" against
+     the conflict dialog's button — which is not inside this panel — concluded no,
+     and yanked focus back into the background form on the very first Tab press.
+     The effect was that Tab was dead inside the conflict dialog: a user could not
+     reach its second button at all. */
+  const modalRef = useModalA11y(Boolean(selectedGame) && !posterModalOpen && !statusPickerOpen && !deleteConfirm && !replayModalOpen && !playingConflict);
+  /* The replay dialog's trap stands down while the run dialog is up, for the same
+     reason the outer one does above it. RunFormDialog registers its own, and two
+     armed traps means the background one decides focus is "not inside my panel"
+     — because it is not, the run dialog is a sibling — and yanks Tab back into
+     the history on the first press. The run form would then have exactly one
+     reachable control. */
+  const replayModalRef = useModalA11y(replayModalOpen && !runDialog);
+  const posterModalRef = useModalA11y(posterModalOpen);
+  const statusPickerRef = useModalA11y(statusPickerOpen);
+  const deleteConfirmRef = useModalA11y(deleteConfirm);
+
+  // Set when the user presses inside the panel; a subsequent click landing on
+  // the backdrop after a drag-select is then ignored (see handleBackdropClick).
+  const dragStartRef = useRef(false);
+
+  useEffect(() => {
+    if (!selectedGame) return;
+    const releaseScrollLock = lockBodyScroll();
+    
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        // Most recently opened layer first, so Escape peels back one step at a
+        // time rather than dismissing the whole modal from three levels down.
+        // The run dialog is the topmost layer when it is up, so it has to be
+        // tested before the history — checked second, Escape would close the
+        // history out from under the form the user was actually looking at.
+        if (runDialog) {
+          closeRunDialog();
+        } else if (deleteConfirm) {
+          setDeleteConfirm(false);
+        } else if (replayModalOpen) {
+          closeReplayHistory();
+        } else if (statusPickerOpen) {
+          setStatusPickerOpen(false);
+        } else if (posterModalOpen) {
+          closePosterModal();
+        } else if (isEditing) {
+          setIsEditing(false);
+        } else {
+          handleClose();
+        }
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      releaseScrollLock();
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [selectedGame, setSelectedGame, isEditing, posterModalOpen, statusPickerOpen, deleteConfirm, replayModalOpen, runDialog, showToast]);
+
+  const handleClose = () => {
+    setSelectedGame(null);
+  };
+
+  const handleBackdropClick = (e: React.MouseEvent) => {
+    if (e.target === e.currentTarget) {
+      if (dragStartRef.current) {
+        // Text was drag-selected inside the panel and released over the
+        // backdrop — treat it as a selection drag, not a close click.
+        dragStartRef.current = false;
+        return;
+      }
+      if (statusPickerOpen) {
+        setStatusPickerOpen(false);
+      } else if (posterModalOpen) {
+        closePosterModal();
+      } else if (isEditing) {
+        setIsEditing(false);
+      } else {
+        handleClose();
+      }
+    }
+  };
+
+  /* Whether the game may be replayed, which decides whether the Playtime cell
+     gets a click target at all. */
+  const canReplaySelected = replayAllowed(selectedGame?.status);
+
+  /* Whether the edited row is an endless title. Drives three things at once —
+     greying the completion date, refusing to save one, and relabelling the third
+     metric cell — so it is derived once here rather than re-tested at each site,
+     where the three could drift apart and leave a form that greys a field the
+     payload still sends. */
+  const endlessSelected = editStatus === "endless";
+
+  /* Open the edit form already aimed at one field.
+
+     Opening it without an aim is not the same thing, and the difference is the
+     whole point of the request: a form that mounts with nothing focused leaves the
+     user to work out which of a dozen controls the metric they just clicked refers
+     to. Aiming it means the click and the caret are the same gesture. */
+  const openEditAt = (target: "rating" | "completed") => {
+    setEditFocusTarget(target);
+    setIsEditing(true);
+  };
+
+  /* Move the caret to the field the metric named.
+
+     Synchronous, with no requestAnimationFrame. A frame was the obvious-looking
+     way to wait for the form to exist — and it is wrong, because a rAF callback is
+     throttled to zero in a hidden or busy document. Measured here: with
+     `document.visibilityState === "hidden"` the callback simply never ran, so the
+     form opened with the caret still on the metric cell. `useEffect` is already
+     exactly the "after React has committed this render" hook, so the fields are
+     in the DOM by the time this body runs and there is nothing to wait for.
+
+     `preventScroll` on focus because the scroll is done explicitly with
+     `block: "center"` — the default would jump the panel to the element's own
+     edge, leaving its label above the fold.
+
+     The date input additionally gets `select()` so typing replaces the value
+     rather than appending inside it, which is the normal expectation for a field a
+     user has just been sent to.
+
+     The target is cleared on every path, including the one where the field is not
+     found, so a rename cannot wedge the form open on the next edit. */
+  useEffect(() => {
+    if (!isEditing || !editFocusTarget) return;
+    const group = '[role="radiogroup"][aria-label="Personal rating"]';
+    const el =
+      editFocusTarget === "completed"
+        ? document.getElementById("edit-game-completed")
+        : // Prefer the currently-selected cell, so re-entering the form to adjust an
+          // existing rating lands on that rating rather than on cell 1.
+          document.querySelector(`${group} [role="radio"][aria-checked="true"]`) ??
+          document.querySelector(`${group} [role="radio"]`);
+    if (el instanceof HTMLElement) {
+      el.scrollIntoView({ block: "center" });
+      el.focus({ preventScroll: true });
+      if (el instanceof HTMLInputElement) el.select();
+    }
+    setEditFocusTarget(null);
+  }, [isEditing, editFocusTarget]);
+
+  return (
+    <>
+    <AnimatePresence>
+      {selectedGame && (
+        <motion.div
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          transition={{ duration: 0.15 }}
+          onClick={handleBackdropClick}
+          onMouseDown={(e) => {
+            if (e.target === e.currentTarget) dragStartRef.current = false;
+          }}
+          className="fixed inset-0 z-50 flex items-start justify-center p-4 overflow-y-auto bg-black/90"
+        >
+          <motion.div
+            ref={modalRef}
+            initial={{ opacity: 0, y: 32 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.24, ease: [0.22, 1, 0.36, 1] }}
+            role="dialog"
+            aria-modal="true"
+            style={{ willChange: "transform" }}
+            aria-labelledby="details-modal-title"
+            onMouseDown={() => { dragStartRef.current = true; }}
+            className="relative w-full max-w-4xl rounded-none border border-brand-border bg-brand-bg text-white shadow-2xl flex flex-col md:flex-row h-[90vh] md:h-[820px] my-auto"
+            onClick={(e) => e.stopPropagation()}
+          >
+        
+
+
+        {/* Left Side: Game Image & Actions */}
+        <div className="w-full md:w-1/3 bg-zinc-950 p-6 flex flex-col justify-between border-r border-brand-border md:overflow-y-auto overscroll-contain shrink-0">
+          <div className="space-y-5">
+            <div className="relative w-full aspect-[2/3] shrink-0 group">
+              {(selectedGame.status === "completed") && (
+                <div className="absolute top-2.5 left-2.5 bg-brand-accent text-zinc-950 p-1.5 z-10 shadow-lg border border-brand-accent">
+                  <Trophy className="w-3.5 h-3.5 text-zinc-950 stroke-[2.5]" />
+                </div>
+              )}
+              <PosterImage
+                src={posterUrl}
+                alt={selectedGame.title}
+                className="w-full h-full object-cover rounded-none border border-brand-border bg-zinc-900"
+              />
+
+              {/* Poster actions — custom posters can only be set/reset while
+                  editing metadata (hidden entirely on the read-only view) */}
+              {isEditing && (
+                <div className="absolute inset-0 bg-black/70 backdrop-blur-[2px] opacity-0 invisible group-hover:opacity-100 group-hover:visible group-focus-within:opacity-100 group-focus-within:visible transition-all duration-200 flex items-center justify-center gap-2 pointer-events-none">
+                  <button
+                    type="button"
+                    title="Set a custom poster (image URL or device upload)"
+                    onClick={() => setPosterModalOpen(true)}
+                    className="flex items-center justify-center gap-1.5 px-4 py-2.5 bg-zinc-950 border border-brand-border text-white text-[10px] font-black uppercase tracking-widest cursor-pointer transition-colors pointer-events-auto select-none hover:bg-zinc-900 hover:border-brand-accent/50 hover:text-brand-accent"
+                  >
+                    <ImageUp className="w-3.5 h-3.5 shrink-0" />
+                    <span className="truncate">Custom Poster</span>
+                  </button>
+                  {posterUrl && (
+                    <button
+                      type="button"
+                      title={selectedGame.steam_appid != null ? "Reset to the Steam poster" : "Reset to the default poster"}
+                      aria-label={selectedGame.steam_appid != null ? "Reset to the Steam poster" : "Reset to the default poster"}
+                      onClick={handleResetPoster}
+                      className="w-10 h-10 shrink-0 flex items-center justify-center bg-zinc-950 border border-brand-border text-brand-muted transition-colors cursor-pointer pointer-events-auto hover:bg-red-500/20 hover:text-red-400 hover:border-red-500/50"
+                    >
+                      <RotateCcw className="w-3.5 h-3.5 shrink-0" />
+                    </button>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {/* Touch devices: hover-only overlay is unreachable, so show a
+                persistent poster action row instead (edit mode only) */}
+            {isEditing && (
+              <div className="hidden gap-2 [@media(hover:none)]:flex">
+                <button
+                  type="button"
+                  title="Set a custom poster (image URL or device upload)"
+                  onClick={() => setPosterModalOpen(true)}
+                  className="flex flex-1 items-center justify-center gap-1.5 px-3 py-2 bg-zinc-950 border border-brand-border text-white text-[10px] font-black uppercase tracking-widest cursor-pointer select-none hover:bg-zinc-900 hover:border-brand-accent/50 hover:text-brand-accent"
+                >
+                  <ImageUp className="w-3.5 h-3.5 shrink-0" />
+                  Custom Poster
+                </button>
+                {posterUrl && (
+                  <button
+                    type="button"
+                    title={selectedGame.steam_appid != null ? "Reset to the Steam poster" : "Reset to the default poster"}
+                    aria-label={selectedGame.steam_appid != null ? "Reset to the Steam poster" : "Reset to the default poster"}
+                    onClick={handleResetPoster}
+                    className="flex items-center justify-center w-10 h-10 bg-zinc-950 border border-brand-border text-brand-muted cursor-pointer hover:bg-red-500/20 hover:text-red-400 hover:border-red-500/50"
+                  >
+                    <RotateCcw className="w-3.5 h-3.5 shrink-0" />
+                  </button>
+                )}
+              </div>
+            )}
+            
+            <div className="space-y-2">
+              <h3 id="details-modal-title" className={`text-xl font-black tracking-tight uppercase ${selectedGame.status === "completed" ? "text-brand-accent" : "text-white"}`}>{selectedGame.title}</h3>
+              <p className="text-xs text-brand-muted uppercase font-bold">
+                {selectedGame.year ? `${selectedGame.year} // ` : ""}{selectedGame.genres?.slice(0, 2).join(", ")}
+              </p>
+              
+              <div className="flex flex-wrap gap-2 pt-1">
+                {customizations.showRatingBadge && selectedGame.critic_score != null && (
+                  <span className="px-2 py-0.5 rounded-none text-[11px] font-black bg-zinc-900 border border-brand-border text-brand-accent">
+                    CRITIC: {selectedGame.critic_score}
+                  </span>
+                )}
+              </div>
+
+              {/* Status — full-width and clickable, sitting below the badge row
+                  and opening the quick picker instead of the full edit form. */}
+              <button
+                type="button"
+                onClick={() => setStatusPickerOpen(true)}
+                aria-haspopup="dialog"
+                aria-label={`Status: ${getStatusLabel(selectedGame.status)}. Change status`}
+                className={`w-full flex items-center justify-between gap-2 px-3 py-2.5 rounded-none border uppercase tracking-wider text-xs font-black transition-colors cursor-pointer hover:brightness-125 ${getStatusBadgeColor(selectedGame.status)}`}
+              >
+                <span>{getStatusLabel(selectedGame.status)}</span>
+                <ChevronDown className="w-4 h-4 shrink-0" />
+              </button>
+
+              {/* Ownership badge. Placed directly under the status button and
+                  above the platform list, because those three are the three
+                  things that describe "where this game stands": how far along
+                  it is, whether it is yours, and where you have it. Dashed
+                  border for the same reason as the library card chip — a
+                  boundary, not another status colour. */}
+              {!isOwned(selectedGame) && (
+                <div className="flex items-center justify-between gap-2 px-3 py-2.5 rounded-none border border-dashed border-zinc-600 uppercase tracking-wider text-xs font-black text-zinc-400">
+                  <span>{getOwnershipLabel(selectedGame.ownership_status)}</span>
+                  <span className="text-[10px] font-bold tracking-widest text-zinc-600">
+                    Not in collection
+                  </span>
+                </div>
+              )}
+
+              {/* Replay count, under the status button and above ownership — the third of the
+                  three facts that describe where a game stands, alongside how far
+                  along it is and whether you hold it.
+
+                  Shown only when the game has actually been replayed. A
+                  "Played 1×" line on the ~95% of a library that has never been
+                  replayed would be noise, and unlike ownership there is no
+                  meaningful zero state worth surfacing.
+
+                  Uses `timesPlayed`/`isReplayed` rather than reading the field, so
+                  a payload predating the migration cannot produce a "Played 0×". */}
+              {isReplayed(selectedGame) && (
+                <div className="flex items-center justify-between gap-2 px-3 py-2.5 rounded-none border border-brand-border bg-zinc-950/60 uppercase tracking-wider text-xs font-black text-white">
+                  <span>Played {timesPlayed(selectedGame)} Times</span>
+                  <span className="text-[10px] font-bold tracking-widest text-brand-accent">
+                    {timesPlayed(selectedGame) - 1} replay{timesPlayed(selectedGame) === 2 ? "" : "s"}
+                  </span>
+                </div>
+              )}
+
+              {/* Gated on ownership, not just on the list being non-empty. The heading says
+                  "Platforms Owned", and a not-owned title has no owned platforms
+                  by definition — so the block is withheld rather than printed
+                  empty or relabelled. The API enforces the same rule, so a stale
+                  tag can never reach this and produce a contradiction. */}
+              {isOwned(selectedGame) && selectedGame.owned_platforms && selectedGame.owned_platforms.filter(p => availablePlatforms.some(ap => platformIdMatches(ap.id, p))).length > 0 && (
+                <div className="pt-2 border-t border-brand-border/45 mt-3">
+                  <p className="text-[11px] text-brand-muted uppercase font-bold tracking-widest mb-1">
+                    Platforms Owned
+                  </p>
+                  <div className="flex flex-wrap gap-1.5">
+                    {selectedGame.owned_platforms.filter(p => availablePlatforms.some(ap => platformIdMatches(ap.id, p))).map(p => {
+                      const platLabel = availablePlatforms.find(ap => platformIdMatches(ap.id, p))?.label || p;
+                      return (
+                        <span key={p} className="px-2.5 py-1 bg-brand-accent text-brand-accent-ink font-black text-[11px] uppercase tracking-wider border border-brand-accent">
+                          {platLabel}
+                        </span>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Primary action, in the same place in both modes: reading offers Edit, and
+              editing offers Save. One control each, so the button never scrolls
+              out of reach on a long form and there is never a second copy of it
+              to keep in step.
+
+              Delete is read-mode only, and not merely for symmetry: while the
+              form is open it would throw away unsaved edits without saying so. */}
+          {isEditing ? (
+            <div className="mt-6 pt-4 border-t border-brand-border">
+              <button
+                type="button"
+                onClick={handleSaveChanges}
+                disabled={saving || resettingMetadata}
+                className="w-full h-10 flex items-center justify-center px-3 rounded-none bg-brand-accent hover:bg-brand-accent-hover text-brand-accent-ink text-xs font-black uppercase tracking-wide border border-transparent transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {saving ? "Saving…" : "Save"}
+              </button>
+            </div>
+          ) : (
+            <div className="flex gap-2 mt-6 pt-4 border-t border-brand-border">
+              <button
+                type="button"
+                onClick={() => setIsEditing(true)}
+                className="flex-1 h-10 min-w-0 flex items-center justify-center gap-2 px-3 rounded-none bg-transparent text-white text-xs font-black uppercase tracking-wide border border-brand-border hover:border-brand-accent/50 transition-colors cursor-pointer"
+              >
+                <Edit2 className="w-3.5 h-3.5 shrink-0 text-brand-accent" />
+                <span className="truncate">Edit Metadata</span>
+              </button>
+              {/* Icon only, and square to match Edit's height. The sidebar is
+                  about 250px of usable width, and a spelled-out "Delete" beside
+                  a spelled-out "Edit Metadata" does not fit at a readable size —
+                  Edit lost its last three letters to an ellipsis while Delete sat
+                  on slack. A bare bin needs no room and reads unambiguously at
+                  this size, so the two controls sit side by side at equal
+                  height without either being abbreviated. The accessible name
+                  is unchanged: it was never the label being shortened that made
+                  this dangerous, it is the one unconfirmed click. */}
+              <button
+                type="button"
+                onClick={() => setDeleteConfirm(true)}
+                aria-label={`Delete ${selectedGame.title}`}
+                title="Delete this game"
+                className="w-10 h-10 shrink-0 flex items-center justify-center rounded-none bg-transparent text-brand-muted border border-brand-border hover:bg-red-500/10 hover:text-red-400 hover:border-red-500/35 transition-colors cursor-pointer"
+              >
+                <Trash2 className="w-4 h-4" />
+              </button>
+            </div>
+          )}
+        </div>
+
+        {/* Right Side: Tab Details */}
+        <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
+          
+          {/* Header Controls (Fixed, does not scroll) */}
+          <div className="px-6 md:px-8 py-4 border-b border-brand-border/60 shrink-0 bg-brand-bg flex justify-between items-center">
+            {isEditing ? (
+              <p className="text-[11px] font-black uppercase tracking-widest text-brand-accent">
+                EDIT METADATA
+              </p>
+            ) : (
+              <p className="text-[11px] font-black uppercase tracking-widest text-brand-accent">TITLE CONTROL PANEL</p>
+            )}
+            <div className="flex items-center gap-2.5">
+              {/* Close only, in both modes. Save lives in the sidebar row beside
+                  the fields it commits, so the header holds one control rather
+                  than two that do the same thing — a duplicate Save is two
+                  places to look for the same button and one more thing to keep in
+                  step. */}
+              <button
+                onClick={() => (isEditing ? setIsEditing(false) : handleClose())}
+                aria-label={isEditing ? "Cancel editing" : "Close (Esc)"}
+                className="w-[34px] h-[34px] rounded-none bg-zinc-950 border border-brand-border text-brand-muted hover:text-white transition-colors cursor-pointer flex items-center justify-center shrink-0"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          </div>
+
+          {/* Scrollable Content Area */}
+          <div className={`flex-1 overflow-y-auto overscroll-contain space-y-6 ${isEditing ? "p-6 md:p-8" : "pt-4 px-6 pb-6 md:px-8 md:pb-8"}`}>
+            {isEditing ? (
+              <div className="space-y-4">
+                {/* Title and release year share a row. They are the two facts
+                    read together when recognising a game, and four digits were
+                    taking a full third of a row to themselves. The title keeps
+                    two thirds because it is the only field here that has to
+                    hold a sentence. */}
+                <div className="grid grid-cols-1 sm:grid-cols-[2fr_1fr] gap-4">
+                  <div className="space-y-1">
+                    <label htmlFor="edit-game-title" className="text-[11px] font-bold uppercase tracking-wider text-brand-muted">Game Title</label>
+                    <input
+                      id="edit-game-title"
+                      type="text"
+                      value={title}
+                      onChange={(e) => setTitle(e.target.value)}
+                      className="w-full px-4 py-2 bg-brand-bg border border-brand-border rounded-none text-xs font-bold uppercase tracking-wide text-white focus:outline-none focus:border-brand-accent"
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <label htmlFor="edit-game-year" className="text-[11px] font-bold uppercase tracking-wider text-brand-muted">Release Year</label>
+                    <input
+                      id="edit-game-year"
+                      type="number"
+                      value={year}
+                      onChange={(e) => setYear(e.target.value)}
+                      className="w-full px-4 py-2 bg-brand-bg border border-brand-border rounded-none text-xs font-bold uppercase tracking-wide text-white focus:outline-none focus:border-brand-accent"
+                    />
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div className="space-y-1">
+                  <label htmlFor="edit-game-completed" className={`text-[11px] font-bold uppercase tracking-wider ${endlessSelected ? "text-brand-muted/40" : "text-brand-muted"}`}>
+                    Completion Date
+                  </label>
+                  <input
+                    id="edit-game-completed"
+                    type="date"
+                    value={dateCompleted || ""}
+                    onChange={(e) => setDateCompleted(e.target.value)}
+                    /* Disabled rather than merely ignored on endless titles.
+
+                       A date field that accepts input you are then told does not
+                       apply is worse than one that cannot be typed into: the value
+                       sits there looking meaningful and is silently dropped on
+                       save. The server clears it either way — this is the UI
+                       agreeing with the rule, not enforcing it. */
+                    disabled={endlessSelected}
+                    title={endlessSelected ? "An endless title is never completed" : undefined}
+                    className={`w-full px-4 py-2 border rounded-none text-xs font-bold uppercase tracking-wide focus:outline-none ${
+                      endlessSelected
+                        ? "bg-brand-bg/40 border-brand-border/40 text-brand-muted/40 cursor-not-allowed"
+                        : "bg-brand-bg border-brand-border text-white focus:border-brand-accent"
+                    }`}
+                  />
+                  {endlessSelected && (
+                    <p className="text-[8px] uppercase tracking-wider text-brand-muted/70 pt-0.5">
+                      An endless title has no completion date
+                    </p>
+                  )}
+                </div>
+                <div className="space-y-1">
+                  <label htmlFor="edit-game-hours" className="text-[11px] font-bold uppercase tracking-wider text-brand-muted">
+                    Playtime
+                  </label>
+                  <div className="flex gap-2">
+                    <div className="relative flex-1 min-w-0">
+                      <input
+                        id="edit-game-hours"
+                        type="number"
+                        min="0"
+                        step="0.1"
+                        value={hoursPlayed}
+                        onChange={(e) => setHoursPlayed(e.target.value)}
+                        placeholder="Hours"
+                        className="w-full pl-4 pr-7 py-2 bg-brand-bg border border-brand-border rounded-none text-xs font-bold uppercase tracking-wide text-white focus:outline-none focus:border-brand-accent"
+                      />
+                      <span className="absolute right-3 top-1/2 -translate-y-1/2 text-[10px] font-black text-brand-muted pointer-events-none">H</span>
+                    </div>
+                    <div className="relative flex-1 min-w-0">
+                      <input
+                        id="edit-game-minutes"
+                        type="number"
+                        min="0"
+                        step="1"
+                        value={minutesPlayed}
+                        onChange={(e) => setMinutesPlayed(e.target.value)}
+                        placeholder="Minutes"
+                        className="w-full pl-4 pr-7 py-2 bg-brand-bg border border-brand-border rounded-none text-xs font-bold uppercase tracking-wide text-white focus:outline-none focus:border-brand-accent"
+                      />
+                      <span className="absolute right-3 top-1/2 -translate-y-1/2 text-[10px] font-black text-brand-muted pointer-events-none">M</span>
+                    </div>
+                    <button
+                      type="button"
+                      title={hidePlaytime ? "Show playtime" : "Hide playtime"}
+                      onClick={() => setHidePlaytime((prev) => !prev)}
+                      className={`w-[34px] h-[34px] shrink-0 rounded-none border flex items-center justify-center transition-colors cursor-pointer ${
+                        hidePlaytime
+                          ? "bg-brand-accent border-brand-accent text-brand-accent-ink"
+                          : "bg-zinc-950 border-brand-border text-brand-muted hover:text-white hover:border-brand-muted"
+                      }`}
+                    >
+                      <EyeOff className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <label className="text-[11px] font-bold uppercase tracking-wider text-brand-muted">Personal Rating</label>
+                  <span className="flex items-center gap-1.5 text-[11px] font-black uppercase tracking-widest">
+                    <span className={`w-1.5 h-1.5 ${ratingValue > 0 ? "bg-brand-accent" : "bg-zinc-600"}`} />
+                    <span className={ratingValue > 0 ? "text-brand-accent" : "text-brand-muted"}>
+                      {ratingValue > 0 ? `Rated ${ratingValue}/10` : "Unrated"}
+                    </span>
+                  </span>
+                </div>
+                {/* One bordered strip rather than eleven bordered boxes. `divide-x` puts a
+                    single hairline between cells — with a gap and a border on
+                    every button, every divider rendered twice and each cell sat
+                    in its own well.
+
+                    A resting cell carries no colour at all. It inherits the
+                    panel's text colour and nothing else, so ten of the eleven
+                    cells stay visually inert and the one that matters reads
+                    instantly. `text-brand-muted` on the resting state did the
+                    opposite: it painted all ten in the same grey, which is a
+                    colour, so the strip looked like a row of decided states
+                    and the accent had nothing to contrast against.
+
+                    Colour appears on exactly two events — hover and selection.
+                    Hover used to fill every cell from 1 up to the pointer, which
+                    claimed a rating the user had not given; and it was driven
+                    only by mouse events, so keyboard users got no feedback at
+                    all. A single-cell accent tint carries the same "this one is
+                    next" signal without either problem. */}
+                <div
+                  className="grid grid-cols-6 sm:grid-cols-11 divide-x divide-brand-border border border-brand-border"
+                  role="radiogroup"
+                  aria-label="Personal rating"
+                >
+                  <button
+                    type="button"
+                    title="Clear rating"
+                    aria-label="Clear rating"
+                    aria-pressed={ratingValue === 0}
+                    onClick={() => setPersonalRating("")}
+                    className={`aspect-square w-full text-[11px] font-sans font-black cursor-pointer flex items-center justify-center transition-colors duration-100 ${
+                      ratingValue > 0 ? "hover:text-red-400" : "hover:text-brand-muted"
+                    }`}
+                  >
+                    <X className="w-3.5 h-3.5 stroke-[2.5]" />
+                  </button>
+                  {Array.from({ length: 10 }, (_, i) => i + 1).map((n) => {
+                    const selected = ratingValue === n;
+                    return (
+                      <button
+                        key={n}
+                        type="button"
+                        role="radio"
+                        aria-checked={selected}
+                        onClick={() => setPersonalRating(selected ? "" : String(n))}
+                        className={`aspect-square w-full text-[11px] font-sans font-black cursor-pointer select-none transition-colors duration-100 ${
+                          selected
+                            ? "bg-brand-accent text-brand-accent-ink"
+                            : "hover:bg-brand-accent/15 hover:text-brand-accent"
+                        }`}
+                      >
+                        {n}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Status — edited here, saved via Save */}
+              <div className="space-y-2">
+                <span id="edit-game-status-label" className="text-[11px] font-bold uppercase tracking-wider text-brand-muted">Status</span>
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2" role="radiogroup" aria-labelledby="edit-game-status-label">
+                  {STATUSES.map((s) => {
+                    const active = editStatus === s.value;
+                    const tone = STATUS_SELECTOR_TONES[s.value] ?? NEUTRAL_STATUS_TONE;
+                    return (
+                      <button
+                        key={s.value}
+                        type="button"
+                        role="radio"
+                        aria-checked={active}
+                        onClick={() => {
+                          setEditStatus(s.value);
+                          if (s.value === "completed" && !dateCompleted) {
+                            // formatDateInputValue, not toISOString — see the note
+                            // on it at the top of this file. The save path parses
+                            // this field as local midnight, so writing a UTC date
+                            // here stored the previous day for anyone west of
+                            // Greenwich completing a game in the evening.
+                            setDateCompleted(formatDateInputValue(new Date()));
+                          }
+                        }}
+                        className={`h-9 sm:h-10 px-3 rounded-none border text-[11px] font-black uppercase tracking-wider cursor-pointer transition-all flex items-center justify-center ${
+                          active ? tone.on : tone.off
+                        }`}
+                      >
+                        {s.label}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+            {/* Ownership — the one field here that decides whether the title counts as
+                part of the collection, and whether the platform checklist below
+                it is usable at all. It sits directly above that checklist so the
+                consequence of choosing is visible at the moment of choosing. */}
+              <fieldset className="space-y-2">
+                <legend className="text-[11px] font-bold uppercase tracking-wider text-brand-muted">Ownership</legend>
+                <div className="grid grid-cols-2 gap-1.5">
+                  {OWNERSHIP_STATUSES.map((option) => (
+                    <label
+                      key={option.value}
+                      className={`flex flex-col gap-0.5 px-3 py-2 border cursor-pointer transition-colors focus-within:outline-none ${
+                        editOwnership === option.value
+                          ? "bg-brand-accent border-brand-accent text-brand-accent-ink"
+                          : "bg-transparent border-brand-border text-brand-muted hover:text-white hover:border-brand-accent/40"
+                      }`}
+                    >
+                      <input
+                        type="radio"
+                        name="edit-game-ownership"
+                        value={option.value}
+                        checked={editOwnership === option.value}
+                        onChange={() => changeOwnership(option.value)}
+                        className="sr-only"
+                      />
+                      <span className="text-[11px] font-black uppercase tracking-wider">{option.label}</span>
+                      <span className={`text-[10px] font-semibold leading-tight ${
+                        editOwnership === option.value ? "text-brand-accent-ink/75" : "text-brand-muted/70"
+                      }`}>
+                        {option.hint}
+                      </span>
+                    </label>
+                  ))}
+                </div>
+              </fieldset>
+
+              {/* Platform checkboxes. Disabled outright while the title is marked
+                  Not Owned: a platform records a copy in the user's collection,
+                  and there is none here. The fieldset `disabled` takes the whole
+                  group out of the tab order and out of the form's submitted
+                  values, so the tags cannot be toggled at all rather than being
+                  toggled and then discarded on save. */}
+              <fieldset
+                disabled={platformsLocked}
+                className={`space-y-2 transition-opacity ${platformsLocked ? "opacity-40" : ""}`}
+              >
+                <legend className="text-[11px] font-bold uppercase tracking-wider text-brand-muted">
+                  Platform Tag checklist
+                </legend>
+                {platformsLocked && (
+                  <p className="text-[10px] font-semibold normal-case tracking-wider text-brand-muted/90 max-w-prose">
+                    {PLATFORMS_LOCKED_REASON}
+                  </p>
+                )}
+                <div className="flex flex-wrap gap-1.5">
+                  {availablePlatforms.map((plat) => (
+                    /* The checkbox is sr-only, so the focus ring has to come from
+                       the wrapper: `focus-within` is what makes the focused tag
+                       visible. Without it, tabbing through the platform list
+                       moved an invisible focus and there was no way to tell
+                       which tag you were about to toggle. `peer` handles the
+                       checked state so it cannot drift from the input. */
+                    <label
+                      key={plat.id}
+                      className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-none border text-[11px] font-black uppercase tracking-wider transition-colors ${
+                        platformsLocked
+                          ? "cursor-not-allowed border-brand-border text-brand-muted"
+                          : `cursor-pointer focus-within:outline-none ${
+                              selectedPlatforms.includes(plat.id)
+                                ? "bg-brand-accent border-brand-accent text-brand-accent-ink"
+                                : "bg-transparent border-brand-border text-brand-muted hover:text-white hover:border-brand-accent/40"
+                            }`
+                      }`}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={selectedPlatforms.includes(plat.id)}
+                        onChange={() => handlePlatformToggle(plat.id)}
+                        disabled={platformsLocked}
+                        className="sr-only"
+                      />
+                      <span className={`w-1.5 h-1.5 rounded-none border shrink-0 ${
+                        selectedPlatforms.includes(plat.id)
+                          ? "bg-brand-accent-ink border-brand-accent-ink"
+                          : "border-brand-muted"
+                      }`} />
+                      {plat.label}
+                    </label>
+                  ))}
+                </div>
+              </fieldset>
+
+              {/* Reset — the last control among the metadata fields, immediately
+                  above the synopsis. It restores every metadata field on this row
+                  (title, year, genres, synopsis, critic score, poster) to the
+                  defaults its provider holds, so it belongs at the end of the
+                  run of fields it acts on: read the list top to bottom, and
+                  "undo all of the above" is the last thing offered.
+
+                  Full width with its label spelled out rather than the bare icon
+                  it used to wear in the header. From up there it looked like
+                  "close this dialog" next to Save; down here, labelled, there
+                  is nothing to misread.
+
+                  No IGDB link means there are no provider defaults to restore,
+                  so it is disabled with the reason in its title rather than
+                  silently inert. */}
+              <div className="pt-1">
+                <button
+                  type="button"
+                  onClick={handleResetMetadata}
+                  disabled={saving || resettingMetadata || selectedGame.igdb_id == null}
+                  title={selectedGame.igdb_id == null ? "No IGDB link — nothing to reset to" : "Restore every field above to the default IGDB data"}
+                  className="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-none border border-red-500/35 bg-transparent text-red-400 hover:bg-red-500/10 hover:border-red-500/60 text-xs font-black uppercase tracking-wider transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-transparent disabled:hover:border-red-500/35 disabled:hover:text-red-400"
+                >
+                  {resettingMetadata ? <Loader2 className="w-4 h-4 animate-spin" /> : <RotateCcw className="w-4 h-4 shrink-0" />}
+                  {resettingMetadata ? "Restoring…" : "Reset Metadata To Defaults"}
+                </button>
+              </div>
+
+              <div className="space-y-1.5">
+                <label htmlFor="edit-game-synopsis" className="text-[11px] font-bold uppercase tracking-wider text-brand-muted">Game Synopsis / Description</label>
+                <textarea
+                  id="edit-game-synopsis"
+                  value={synopsis}
+                  onChange={(e) => { setSynopsis(e.target.value); synopsisDirtyRef.current = true; }}
+                  rows={8}
+                  className="w-full min-h-[220px] px-4 py-3 bg-brand-bg border border-brand-border rounded-none text-xs sm:text-[13px] font-normal font-sans text-zinc-200 leading-relaxed focus:outline-none focus:border-brand-accent resize-y"
+                  placeholder="Enter synopsis or sync from IGDB"
+                />
+              </div>
+
+            </div>
+          ) : (
+            <div className="space-y-6">
+              <div className="pt-0">
+                <div className="text-zinc-300 text-xs sm:text-sm font-sans space-y-3 leading-relaxed pr-2 select-text">
+                  {selectedGame.synopsis ? (
+                    selectedGame.synopsis.split('\n\n').map((paragraph: string, idx: number) => (
+                      <p key={idx}>{paragraph}</p>
+                    ))
+                  ) : (
+                    <p className="text-brand-muted text-xs uppercase">No description available.</p>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
+          </div>
+
+          {/* Status + Registry Metrics Footer (Permanently at the bottom when not editing) */}
+          {!isEditing && (
+            <div className="px-6 py-5 md:px-8 md:py-6 border-t border-brand-border/60 shrink-0 bg-zinc-950/85 backdrop-blur-sm space-y-3">
+              {/* Registry Metrics */}
+              <div className="grid grid-cols-3 gap-3">
+                {/* The playtime cell is the entry point to replay history, so it is a button.
+
+                      Playtime is the field a replay actually changes — a second
+                      run adds time without touching anything else on this row —
+                      so this is the metric a user is reaching for when they think
+                      "I beat this again". Putting the disclosure here keeps the
+                      read view's scroll area to synopsis + metrics and moves the
+                      growing per-run list into a layer that can hold it.
+
+                      Labelled "Playtime" and showing the ALL-RUNS total. The
+                      alternative was to keep the game's own `playtime` (run #1
+                      only) and call it something like "First Run Hours", but then
+                      the number a plain word promises is not the number shown —
+                      a game beaten three times for 31h reported "Playtime 4h".
+                      The total is what "playtime" means; the per-run split is one
+                      click away, and the first run is listed there as Playthrough 1.
+
+                      The clickable affordance is a DASHED RULE under the value,
+                      present at rest rather than only on hover. Hover-only signals
+                      do not work for the two cases that matter most here — a
+                      keyboard user tabbing through, and a touch user who never
+                      generates a hover state at all. The rule turns accent on
+                      hover/focus, so it reads as the same object getting more
+                      committed rather than as a new one appearing. Deliberately
+                      not a chevron: that would make one cell in a row of three
+                      look like a different *kind* of thing rather than the same
+                      thing that opens something. */}
+                  {/* Playtime — the entry point to replay history. Until the game is
+                      Completed there is nothing to open, so `onOpen` is omitted
+                      and MetricCell renders a plain box: no cursor, no hover, no
+                      dashed rule. Keeping the affordance while removing the action
+                      would be worse than either — a clickable-looking cell that
+                      opens nothing.
+
+                      The value is the ALL-RUNS total, so the plain word "Playtime"
+                      is not a lie about a game beaten several times. The per-run
+                      split is one click away, with the first run listed as
+                      Playthrough 1. */}
+                  <MetricCell
+                    label="Playtime"
+                    onOpen={canReplaySelected ? () => setReplayModalOpen(true) : undefined}
+                    ariaLabel={canReplaySelected
+                      ? `Playtime for ${selectedGame.title}: ${playtimeTitle(selectedGame)}. Open replay history.`
+                      : undefined}
+                    /* The "+" — log another playthrough, skipping the list.
+                        Withheld until the game is Completed, matching the cell's
+                        own click target and the panel's add button: a greyed-out
+                        "+" still advertises an action this game does not have. */
+                    cornerAction={canReplaySelected ? (
+                      <button
+                        type="button"
+                        onClick={openLogReplay}
+                        aria-label={`Log another playthrough of ${selectedGame.title}`}
+                        title="Log another playthrough of this game"
+                        className="absolute top-1.5 right-1.5 w-6 h-6 flex items-center justify-center rounded-none bg-transparent border border-transparent text-zinc-500 hover:text-brand-accent transition-colors cursor-pointer focus:outline-none focus-visible:border-brand-accent/50"
+                      >
+                        <Plus className="w-3 h-3" aria-hidden />
+                      </button>
+                    ) : undefined}
+                    hiddenBorder={selectedGame.hide_playtime === 1}
+                    /* No line-through. It was here to say "this number is
+                       suppressed", but the value being struck out is the word
+                       HIDDEN — so the label reading "hidden" was itself struck
+                       through, which reads as a crossed-out label rather than a
+                       suppressed figure. The eye icon, the red and the dashed
+                       frame already carry it, and none of them contradict the
+                       words. */
+                    valueClassName={selectedGame.hide_playtime === 1 ? "text-red-400/80" : "text-white"}
+                    value={
+                      selectedGame.hide_playtime === 1
+                        ? /* Inline-flex, so the icon sits beside the word.
+                             lucide renders <svg display:block> to stop SVGs
+                             opening a baseline gap, which means inside a block
+                             heading the icon became its own line and the cell read
+                             as a stacked badge rather than one value. */
+                          <span className="inline-flex items-center gap-1.5">
+                            <EyeOff className="w-3.5 h-3.5 shrink-0" aria-hidden />
+                            Hidden
+                          </span>
+                        : <>{formatPlaytimePrecise(totalPlaytime(selectedGame))}
+                            {/* The run count is part of the affordance — it is what
+                                tells you there is something to open — so it is
+                                withheld along with the click target rather than
+                                left behind on a cell that does nothing. */}
+                            {canReplaySelected && isReplayed(selectedGame) && (
+                              <span className="text-[10px] font-black text-brand-accent tracking-widest align-baseline">
+                                {" "}×{timesPlayed(selectedGame)}
+                              </span>
+                            )}
+                          </>
+                    }
+                  />
+
+                  {/* Your Rating — opens the edit form on the rating itself rather
+                      than merely opening it. Landing the user on a form with
+                      nothing focused and ten cells to find is the same as not
+                      knowing which cell the metric referred to. */}
+                  <MetricCell
+                    label="Your Rating"
+                    onOpen={() => openEditAt("rating")}
+                    ariaLabel={`Your rating for ${selectedGame.title}: ${selectedGame.personal_rating !== null ? `${selectedGame.personal_rating} out of 10` : "not rated"}. Edit your rating.`}
+                    valueClassName="text-brand-accent"
+                    value={selectedGame.personal_rating !== null ? `${selectedGame.personal_rating}/10` : "—"}
+                  />
+
+                  {/* Completed — the completion date, not the entry date. It is
+                      the one date a reader actually asks about ("when did I finish
+                      this?"), and the entry date survives as the library's default
+                      sort key.
+
+                      Gated on the status as well as the date, for the same reason
+                      the analytics chart is: the server stamps `date_completed`
+                      when a title enters completed and never clears it on the way
+                      out, so a title moved back to backlog keeps a stale date.
+                      Showing it raw would put a completion date under a game with
+                      zero hours and no grade. An em dash matches the rating box
+                      beside it for "not recorded". */}
+                  {/* "COMPLETED" is a lie on an endless title — by definition it is never
+                    completed — so the third cell becomes the date the title was
+                    added to the library. That date always exists, and it answers
+                    the question an endless title can still answer: how long has
+                    this been on the shelf. Clicking it still opens the edit form;
+                    for an endless title that field is disabled, which is the same
+                    thing the cell says by being labelled differently. */}
+                  <MetricCell
+                    label={endlessSelected ? "Date Added" : "Completed"}
+                    onOpen={() => openEditAt("completed")}
+                    ariaLabel={endlessSelected
+                      ? `Added to the library ${formatDateShort(selectedGame.date_added)}. Edit the completion date.`
+                      : selectedGame.status === "completed" && selectedGame.date_completed
+                        ? `Completed on ${formatDateShort(selectedGame.date_completed)}. Edit the completion date.`
+                        : "No completion date recorded. Edit the completion date."}
+                    value={endlessSelected
+                      ? formatDateShort(selectedGame.date_added)
+                      : selectedGame.status === "completed" && selectedGame.date_completed
+                        ? formatDateShort(selectedGame.date_completed)
+                        : "—"}
+                  />
+                </div>
+            </div>
+          )}
+
+        </div>
+
+        </motion.div>
+      </motion.div>
+      )}
+    </AnimatePresence>
+
+    {/* Replay history modal — opened from the hours metric. z-[70] matches the
+        poster dialog; the two are mutually exclusive (the poster dialog is
+        edit-mode only, and this one is read-mode only) so they never stack. */}
+    <AnimatePresence>
+      {selectedGame && replayModalOpen && (
+        <motion.div
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          transition={{ duration: 0.15 }}
+          className="fixed inset-0 z-[70] flex items-center justify-center p-4 bg-black/80"
+          onClick={(e) => { if (e.target === e.currentTarget) closeReplayHistory(); }}
+        >
+          <motion.div
+            ref={replayModalRef}
+            initial={{ scale: 0.96, opacity: 0 }}
+            animate={{ scale: 1, opacity: 1 }}
+            exit={{ scale: 0.96, opacity: 0 }}
+            transition={{ duration: 0.15 }}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="replay-modal-title"
+            /* Two-stage height: grow to fit short content, then stop and scroll.
+
+               `min(640px, calc(100dvh - 2rem))` — a bare `max-h-[85vh]` was
+               only a ceiling, so the dialog still grew to whatever the content
+               needed and opening the "log a replay" form pushed it to ~846px,
+               most of the screen, with the details modal behind reduced to a
+               sliver. 640px keeps the panel a panel.
+
+               The second term is the viewport minus the backdrop's own `p-4`.
+               85vh left the panel taller than the space it was centred in, so on
+               a short viewport it overflowed the flex line at BOTH ends and the
+               top of the header went off screen — and there was nothing to
+               scroll, because the overflow was on the dialog rather than inside
+               it. `dvh` rather than `vh` so a collapsing mobile address bar
+               cannot shrink the viewport under the panel's feet. */
+            className="relative w-full max-w-2xl max-h-[min(640px,calc(100dvh-2rem))] flex flex-col overflow-hidden border border-brand-border bg-brand-bg text-white shadow-2xl"
+          >
+            <div className="px-5 pt-4 pb-4 border-b border-brand-border/60 shrink-0 flex items-start justify-between gap-4">
+              <div className="min-w-0">
+                <p id="replay-modal-title" className="text-[11px] font-black uppercase tracking-widest text-brand-accent">
+                  Replay History
+                </p>
+                {/* The game's name is the subject of the whole panel, so it is set
+                    as a title rather than as a caption under the dialog's own
+                    label. It was `text-[11px] text-brand-muted` — smaller than the
+                    label above it. */}
+                <p className="mt-1 text-sm font-black uppercase tracking-tight text-white truncate">
+                  {selectedGame.title}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={closeReplayHistory}
+                aria-label="Close replay history"
+                className="w-[30px] h-[30px] shrink-0 rounded-none bg-zinc-950 border border-brand-border text-brand-muted hover:text-white hover:border-brand-accent/50 transition-colors cursor-pointer flex items-center justify-center"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+            <div className="flex-1 min-h-0 flex flex-col">
+              <ReplayHistory
+              game={selectedGame}
+              hideHeading
+              onLogReplay={openLogReplay}
+              onEditRun={openEditRun}
+            />
+            </div>
+          </motion.div>
+        </motion.div>
+      )}
+    </AnimatePresence>
+
+    {/* Add / edit run dialog — the topmost layer, raised from inside the replay
+        history. Rendered last so it paints over it, and owned here rather than by
+        ReplayHistory so this component keeps sole control of which focus traps are
+        armed (see the `useModalA11y` calls) and of the Escape peel order. */}
+    {selectedGame && runDialog && (
+      <RunFormDialog
+        mode={runDialog}
+        gameTitle={selectedGame.title}
+        draft={runDraft}
+        setDraft={(patch) => setRunDraft((d) => ({ ...d, ...patch }))}
+        busy={runBusy}
+        onClose={closeRunDialog}
+        onSubmit={submitRun}
+      />
+    )}
+
+    {/* Change Poster modal — set a custom poster via image URL or device upload */}
+    <AnimatePresence>
+      {selectedGame && posterModalOpen && (
+        <motion.div
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          transition={{ duration: 0.15 }}
+          className="fixed inset-0 z-[70] flex items-center justify-center p-4 bg-black/80"
+          onClick={(e) => { if (e.target === e.currentTarget) closePosterModal(); }}
+        >
+          <motion.div
+            ref={posterModalRef}
+            initial={{ scale: 0.96, opacity: 0 }}
+            animate={{ scale: 1, opacity: 1 }}
+            exit={{ scale: 0.96, opacity: 0 }}
+            transition={{ duration: 0.15 }}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="poster-modal-title"
+            className="w-full max-w-md bg-brand-bg border border-brand-border shadow-2xl"
+          >
+            <div className="px-5 py-4 border-b border-brand-border/60 flex items-center justify-between">
+              <h3 id="poster-modal-title" className="text-[11px] font-black uppercase tracking-widest text-brand-accent">
+                Change Poster
+              </h3>
+              <button
+                type="button"
+                onClick={closePosterModal}
+                aria-label="Close poster dialog"
+                className="w-[30px] h-[30px] rounded-none bg-zinc-950 border border-brand-border text-brand-muted hover:text-white transition-colors cursor-pointer flex items-center justify-center"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+
+            <div className="p-5 space-y-4">
+              {/* Option 1: image URL */}
+              <div className="space-y-1.5">
+                <label htmlFor="poster-url-input" className="text-[11px] font-bold uppercase tracking-wider text-brand-muted">
+                  Poster image URL
+                </label>
+                <div className="flex gap-2">
+                  <input
+                    id="poster-url-input"
+                    type="url"
+                    value={posterUrlInput}
+                    onChange={(e) => setPosterUrlInput(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === "Enter") handleApplyPosterUrl(); }}
+                    placeholder="https://example.com/poster.jpg"
+                    className="flex-1 min-w-0 px-3 py-2 bg-brand-bg border border-brand-border rounded-none text-xs text-white focus:outline-none focus:border-brand-accent placeholder:text-zinc-600"
+                  />
+                  <button
+                    type="button"
+                    onClick={handleApplyPosterUrl}
+                    disabled={posterSaving || !posterUrlInput.trim()}
+                    className="flex items-center gap-1.5 px-3 py-2 bg-brand-accent hover:bg-brand-accent-hover text-brand-accent-ink rounded-none text-[10px] font-black uppercase tracking-widest transition-colors cursor-pointer shrink-0 disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    {posterSaving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Link2 className="w-3.5 h-3.5" />}
+                    Apply
+                  </button>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-3">
+                <div className="flex-1 h-px bg-brand-border/60" />
+                <span className="text-[9px] font-bold uppercase tracking-widest text-brand-muted">or</span>
+                <div className="flex-1 h-px bg-brand-border/60" />
+              </div>
+
+              {/* Option 2: upload from device */}
+              <label
+                htmlFor="poster-modal-file"
+                className={`w-full h-11 flex items-center justify-center gap-2 px-4 rounded-none bg-transparent border border-brand-border text-xs font-black uppercase tracking-wider transition-all select-none ${
+                  posterSaving ? "opacity-50 cursor-not-allowed" : "hover:bg-brand-accent/[0.03] hover:text-white text-brand-muted cursor-pointer"
+                }`}
+              >
+                {posterSaving ? <Loader2 className="w-4 h-4 animate-spin" /> : <ImageUp className="w-4 h-4 text-brand-accent" />}
+                Upload from device
+              </label>
+              <input
+                id="poster-modal-file"
+                type="file"
+                accept="image/png,image/jpeg,image/webp"
+                className="hidden"
+                disabled={posterSaving}
+                onChange={(e) => {
+                  const file = e.target.files?.[0];
+                  if (file) handleUploadPoster(file);
+                  e.target.value = "";
+                }}
+              />
+              <p className="text-[10px] text-brand-muted uppercase tracking-wider leading-relaxed">
+                PNG, JPEG or WebP — uploads are resized and stored locally. Use Reset to restore the original poster.
+              </p>
+            </div>
+          </motion.div>
+        </motion.div>
+      )}
+    </AnimatePresence>
+
+    {/* Delete confirmation — a small dialog over the details modal rather than
+        an inline swap of the Delete button for a "Confirm Delete" one.
+
+        The inline version destroyed the control that opened it, so the way back
+        out was a bare ✕ with no label, sitting next to a red button in the one
+        place on the card where a stray click deletes a library row. A dialog
+        keeps Delete where it is, names the game being deleted, and puts the
+        destructive action second in reading order with Cancel first for focus.
+
+        Sibling of the other dialogs rather than nested inside them, for the
+        same reason the poster modal is: the panel above animates, and a
+        transformed ancestor becomes the containing block for `position: fixed`.
+        z-[80] puts it above the poster dialog's z-[70]; the two are mutually
+        exclusive in practice, so this only makes the stacking explicit. */}
+    <AnimatePresence>
+      {selectedGame && deleteConfirm && (
+        <motion.div
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          transition={{ duration: 0.15 }}
+          className="fixed inset-0 z-[80] flex items-center justify-center p-4 bg-black/85"
+          onClick={(e) => { if (e.target === e.currentTarget) setDeleteConfirm(false); }}
+        >
+          <motion.div
+            ref={deleteConfirmRef}
+            initial={{ scale: 0.96, opacity: 0 }}
+            animate={{ scale: 1, opacity: 1 }}
+            exit={{ scale: 0.96, opacity: 0 }}
+            transition={{ duration: 0.15 }}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="delete-modal-title"
+            aria-describedby="delete-modal-body"
+            className="w-full max-w-sm bg-brand-bg border border-red-500/40 shadow-2xl"
+          >
+            <div className="px-5 py-4 border-b border-brand-border/60">
+              <h3 id="delete-modal-title" className="text-[11px] font-black uppercase tracking-widest text-red-400">
+                Delete this game?
+              </h3>
+            </div>
+
+            <div className="p-5 space-y-5">
+              <p id="delete-modal-body" className="text-xs font-sans text-zinc-300 leading-relaxed">
+                <span className="font-black uppercase text-white block mb-1 break-words">
+                  {selectedGame.title}
+                </span>
+                will be removed from your library, along with its playtime, rating
+                and completion date. This cannot be undone.
+              </p>
+
+              <div className="flex gap-2">
+                {/* Cancel first, so it is what focus lands on when the dialog
+                    opens. The destructive action is never the default. */}
+                <button
+                  type="button"
+                  onClick={() => setDeleteConfirm(false)}
+                  autoFocus
+                  className="flex-1 px-4 py-2.5 rounded-none bg-transparent border border-brand-border text-brand-muted hover:text-white hover:border-brand-accent/50 text-xs font-black uppercase tracking-wider transition-colors cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={handleDelete}
+                  disabled={deleting}
+                  className="flex-1 px-4 py-2.5 rounded-none bg-red-600 hover:bg-red-500 text-brand-on-color border border-red-600 text-xs font-black uppercase tracking-wider transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {deleting ? "Deleting…" : "Delete Game"}
+                </button>
+              </div>
+            </div>
+          </motion.div>
+        </motion.div>
+      )}
+    </AnimatePresence>
+
+    {/* Quick status picker — opened by the full-width status button in the
+        sidebar. Applies immediately, so no edit form and no second Save. */}
+    <AnimatePresence>
+      {selectedGame && statusPickerOpen && (
+        <motion.div
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          transition={{ duration: 0.15 }}
+          className="fixed inset-0 z-[70] flex items-center justify-center p-4 bg-black/80"
+          onClick={(e) => { if (e.target === e.currentTarget) setStatusPickerOpen(false); }}
+        >
+          <motion.div
+            ref={statusPickerRef}
+            initial={{ scale: 0.96, opacity: 0 }}
+            animate={{ scale: 1, opacity: 1 }}
+            exit={{ scale: 0.96, opacity: 0 }}
+            transition={{ duration: 0.15 }}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="status-picker-title"
+            className="w-full max-w-sm bg-brand-bg border border-brand-border shadow-2xl"
+          >
+            <div className="px-5 py-4 border-b border-brand-border/60 flex items-center justify-between gap-3">
+              <div className="min-w-0">
+                <h3 id="status-picker-title" className="text-[11px] font-black uppercase tracking-widest text-brand-accent">
+                  Change Status
+                </h3>
+                <p className="text-[10px] text-brand-muted uppercase tracking-wider truncate mt-0.5">
+                  {selectedGame.title}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setStatusPickerOpen(false)}
+                aria-label="Close status dialog"
+                className="w-[30px] h-[30px] shrink-0 rounded-none bg-zinc-950 border border-brand-border text-brand-muted hover:text-white transition-colors cursor-pointer flex items-center justify-center"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+
+            <div className="p-3 space-y-1.5">
+              {STATUSES.map((opt) => {
+                const active = opt.value === selectedGame.status;
+                return (
+                  <button
+                    key={opt.value}
+                    type="button"
+                    disabled={statusBusy}
+                    onClick={() => handleQuickStatus(opt.value)}
+                    aria-current={active}
+                    className={`w-full flex items-center justify-between gap-2 px-3 py-2.5 rounded-none border text-xs font-black uppercase tracking-wider transition-colors cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed ${
+                      active
+                        ? getStatusBadgeColor(opt.value)
+                        : "bg-zinc-950/40 border-brand-border/60 text-brand-muted hover:border-brand-accent hover:text-white"
+                    }`}
+                  >
+                    <span>{opt.label}</span>
+                    {active && <Check className="w-4 h-4 shrink-0" />}
+                  </button>
+                );
+              })}
+            </div>
+
+            {statusBusy && (
+              <div className="px-5 pb-4 flex items-center gap-2 text-[10px] uppercase tracking-wider text-brand-muted">
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                Saving…
+              </div>
+            )}
+          </motion.div>
+        </motion.div>
+      )}
+    </AnimatePresence>
+    </>
+  );
+});
+export default GameDetailsModal;
